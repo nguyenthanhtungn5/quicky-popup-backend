@@ -49,9 +49,7 @@ if (!existing) {
     VALUES (?, ?, ?, ?)
   `);
 
-  insertParticipant.run("1", "Test-Session-1", "Bin", "15h");
-  insertParticipant.run("2", "Test-Session-1", "Thanh", "15h");
-  insertParticipant.run("3", "Test-Session-1", "Nga", "16h");
+  insertParticipant.run("1", "Test-Session-1", "Tung", "15h");
 }
 
 app.get("/api/session", (req, res) => {
