@@ -68,34 +68,36 @@ app.get("/api/session", (req, res) => {
 });
 
 app.post("/api/session/participants", (req, res) => {
-  const { name, slot } = req.body;
+  const { id, name, slot } = req.body;
 
-  if (!name || !slot) {
-    return res
-      .status(400)
-      .json({ message: "Name und Slot sind erforderlich." });
+  if (!id || !name || !slot) {
+    return res.status(400).json({ message: "id, name and slot are required" });
   }
 
   const session = db.prepare("SELECT * FROM sessions LIMIT 1").get();
 
-  const count = db
-    .prepare("SELECT COUNT(*) as count FROM participants WHERE session_id = ?")
-    .get(session.id).count;
+  db.prepare("DELETE FROM participants WHERE id = ? AND session_id = ?").run(
+    id,
+    session.id,
+  );
 
-  if (count >= session.capacity) {
-    return res.status(400).json({ message: "Session ist voll." });
+  if (slot !== "NO") {
+    db.prepare(
+      `
+      INSERT INTO participants (id, session_id, name, slot)
+      VALUES (?, ?, ?, ?)
+    `,
+    ).run(id, session.id, name, slot);
   }
 
-  const id = crypto.randomUUID();
+  const participants = db
+    .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
+    .all(session.id);
 
-  db.prepare(
-    `
-    INSERT INTO participants (id, session_id, name, slot)
-    VALUES (?, ?, ?, ?)
-  `,
-  ).run(id, session.id, name, slot);
-
-  res.status(201).json({ id, name, slot });
+  res.json({
+    ...session,
+    participants,
+  });
 });
 
 app.delete("/api/session/participants/:id", (req, res) => {
