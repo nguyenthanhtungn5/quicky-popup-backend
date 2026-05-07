@@ -103,6 +103,41 @@ app.delete("/api/session/participants/:id", (req, res) => {
   res.status(204).send();
 });
 
+app.post("/api/session", (req, res) => {
+  const { title, subtitle, capacity, link } = req.body;
+
+  if (!title || !capacity) {
+    return res.status(400).json({ message: "title and capacity are required" });
+  }
+
+  const id = `session-${Date.now()}`;
+
+  db.prepare("DELETE FROM participants").run();
+  db.prepare("DELETE FROM sessions").run();
+
+  db.prepare(
+    `
+    INSERT INTO sessions (id, title, subtitle, capacity, link)
+    VALUES (?, ?, ?, ?, ?)
+  `,
+  ).run(
+    id,
+    title,
+    subtitle || "-",
+    Number(capacity) || 10,
+    link || "https://www.auzora.de",
+  );
+
+  res.status(201).json({
+    id,
+    title,
+    subtitle: subtitle || "-",
+    capacity: Number(capacity) || 10,
+    link: link || "https://www.auzora.de",
+    participants: [],
+  });
+});
+
 app.listen(8080, () => {
   console.log("Backend läuft auf http://localhost:8080");
 });
