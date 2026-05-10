@@ -15,6 +15,7 @@ db.exec(`
     subtitle TEXT,
     capacity INTEGER NOT NULL,
     link TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
   );
 
@@ -44,21 +45,62 @@ const getSessionWithParticipants = (sessionId) => {
 
 app.get("/api/sessions", (req, res) => {
   const sessions = db
-    .prepare("SELECT * FROM sessions ORDER BY created_at DESC")
+    .prepare(
+      "SELECT * FROM sessions WHERE archived = 0 ORDER BY created_at DESC",
+    )
     .all();
 
-  const result = sessions.map((session) => {
-    const participants = db
+  const result = sessions.map((session) => ({
+    ...session,
+    participants: db
       .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
-      .all(session.id);
-
-    return {
-      ...session,
-      participants,
-    };
-  });
+      .all(session.id),
+  }));
 
   res.json(result);
+});
+
+app.get("/api/sessions/archived", (req, res) => {
+  const sessions = db
+    .prepare(
+      "SELECT * FROM sessions WHERE archived = 1 ORDER BY created_at DESC",
+    )
+    .all();
+
+  const result = sessions.map((session) => ({
+    ...session,
+    participants: db
+      .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
+      .all(session.id),
+  }));
+
+  res.json(result);
+});
+
+app.patch("/api/session/:id/archive", (req, res) => {
+  const sessionId = req.params.id;
+
+  const session = getSessionWithParticipants(sessionId);
+  if (!session) {
+    return res.status(404).json({ message: "Session not found" });
+  }
+
+  db.prepare("UPDATE sessions SET archived = 1 WHERE id = ?").run(sessionId);
+
+  res.json(getSessionWithParticipants(sessionId));
+});
+
+app.patch("/api/session/:id/unarchive", (req, res) => {
+  const sessionId = req.params.id;
+
+  const session = getSessionWithParticipants(sessionId);
+  if (!session) {
+    return res.status(404).json({ message: "Session not found" });
+  }
+
+  db.prepare("UPDATE sessions SET archived = 0 WHERE id = ?").run(sessionId);
+
+  res.json(getSessionWithParticipants(sessionId));
 });
 
 app.get("/api/session", (req, res) => {
