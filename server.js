@@ -47,7 +47,18 @@ app.get("/api/sessions", (req, res) => {
     .prepare("SELECT * FROM sessions ORDER BY created_at DESC")
     .all();
 
-  res.json(sessions);
+  const result = sessions.map((session) => {
+    const participants = db
+      .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
+      .all(session.id);
+
+    return {
+      ...session,
+      participants,
+    };
+  });
+
+  res.json(result);
 });
 
 app.get("/api/session", (req, res) => {
