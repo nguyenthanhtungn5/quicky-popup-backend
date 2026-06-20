@@ -55,7 +55,26 @@ db.exec(`
   court_count INTEGER NOT NULL DEFAULT 1,
   max_players INTEGER,
   FOREIGN KEY (session_id) REFERENCES sessions(id)
-);
+  );
+
+  CREATE TABLE IF NOT EXISTS participant_slots (
+    session_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, participant_id, slot_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id),
+    FOREIGN KEY (slot_id) REFERENCES session_slots(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS waitlist (
+  id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  note TEXT,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (id, session_id),
+  FOREIGN KEY (session_id) REFERENCES sessions(id)
+  );
 `);
 
 const getSessionWithParticipants = (sessionId) => {
@@ -67,7 +86,20 @@ const getSessionWithParticipants = (sessionId) => {
 
   const participants = db
     .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
-    .all(session.id);
+    .all(session.id)
+    .map((p) => ({
+      ...p,
+      slotIds: db
+        .prepare(
+          `
+        SELECT slot_id
+        FROM participant_slots
+        WHERE session_id = ? AND participant_id = ?
+      `,
+        )
+        .all(session.id, p.id)
+        .map((row) => row.slot_id),
+    }));
 
   const slots = db
     .prepare(
@@ -80,7 +112,18 @@ const getSessionWithParticipants = (sessionId) => {
   `,
     )
     .all(session.id);
-  return { ...session, slots, participants };
+
+  const waitlist = db
+    .prepare(
+      `
+    SELECT id, name, note, position
+    FROM waitlist
+    WHERE session_id = ?
+    ORDER BY position
+  `,
+    )
+    .all(session.id);
+  return { ...session, slots, participants, waitlist };
 };
 
 app.get("/api/sessions", (req, res) => {
@@ -173,6 +216,8 @@ app.post("/api/session", (req, res) => {
     link,
     additionalInfo = "",
     slots = [],
+    participants = [],
+    waitlist = [],
   } = req.body;
 
   const id = `session-${Date.now()}`;
@@ -212,36 +257,107 @@ app.post("/api/session", (req, res) => {
     );
   });
 
+  const insertParticipant = db.prepare(`
+  INSERT INTO participants (id, session_id, name, slot)
+  VALUES (?, ?, ?, ?)
+`);
+
+  participants.forEach((p, index) => {
+    if (!p.name?.trim()) return;
+
+    insertParticipant.run(
+      `${id}-participant-${index}`,
+      id,
+      p.name.trim(),
+      `${p.startTime || ""}-${p.endTime || ""}`,
+    );
+  });
+
+  const insertWaitlist = db.prepare(`
+  INSERT INTO waitlist (id, session_id, name, note, position)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+  waitlist.forEach((p, index) => {
+    if (!p.name?.trim()) return;
+
+    insertWaitlist.run(
+      `${id}-waitlist-${index}`,
+      id,
+      p.name.trim(),
+      p.note || "",
+      index + 1,
+    );
+  });
+
   res.status(201).json(getSessionWithParticipants(id));
 });
 
 app.post("/api/session/:id/participants", (req, res) => {
-  const { id, name, slot } = req.body;
+  const { id, name, slotIds = [] } = req.body;
   const sessionId = req.params.id;
 
-  if (!id || !name || !slot) {
-    return res.status(400).json({ message: "id, name and slot are required" });
+  if (!id || !name) {
+    return res.status(400).json({ message: "id and name are required" });
   }
 
   const session = getSessionWithParticipants(sessionId);
-
   if (!session) {
     return res.status(404).json({ message: "Session not found" });
   }
 
-  db.prepare("DELETE FROM participants WHERE id = ? AND session_id = ?").run(
-    id,
-    sessionId,
-  );
+  db.prepare(
+    `
+    INSERT INTO participants (id, session_id, name, slot)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(id, session_id) DO UPDATE SET
+      name = excluded.name,
+      slot = excluded.slot
+  `,
+  ).run(id, sessionId, name, slotIds.join(","));
 
-  if (slot !== "NO") {
+  db.prepare(
+    `
+    DELETE FROM participant_slots
+    WHERE session_id = ? AND participant_id = ?
+  `,
+  ).run(sessionId, id);
+
+  for (const slotId of slotIds) {
     db.prepare(
       `
-      INSERT INTO participants (id, session_id, name, slot)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO participant_slots (session_id, participant_id, slot_id)
+      VALUES (?, ?, ?)
     `,
-    ).run(id, sessionId, name, slot);
+    ).run(sessionId, id, slotId);
   }
+
+  res.json(getSessionWithParticipants(sessionId));
+});
+
+app.post("/api/session/:id/waitlist", (req, res) => {
+  const sessionId = req.params.id;
+  const { id, name, note = "" } = req.body;
+
+  if (!id || !name) {
+    return res.status(400).json({ message: "id and name are required" });
+  }
+
+  const maxPosition = db
+    .prepare(
+      "SELECT COALESCE(MAX(position), 0) AS max FROM waitlist WHERE session_id = ?",
+    )
+    .get(sessionId).max;
+
+  db.prepare(
+    `
+    INSERT INTO waitlist (id, session_id, name, note, position)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id, session_id) DO UPDATE SET
+      name = excluded.name,
+      note = excluded.note
+  `,
+  ).run(id, sessionId, name, note, maxPosition + 1);
 
   res.json(getSessionWithParticipants(sessionId));
 });
@@ -249,12 +365,40 @@ app.post("/api/session/:id/participants", (req, res) => {
 app.delete(
   "/api/session/:sessionId/participants/:participantId",
   (req, res) => {
+    const { sessionId, participantId } = req.params;
+
     db.prepare("DELETE FROM participants WHERE id = ? AND session_id = ?").run(
-      req.params.participantId,
-      req.params.sessionId,
+      participantId,
+      sessionId,
     );
 
-    res.status(204).send();
+    const firstWaitlist = db
+      .prepare(
+        `
+      SELECT *
+      FROM waitlist
+      WHERE session_id = ?
+      ORDER BY position
+      LIMIT 1
+    `,
+      )
+      .get(sessionId);
+
+    if (firstWaitlist) {
+      db.prepare(
+        `
+      INSERT INTO participants (id, session_id, name, slot)
+      VALUES (?, ?, ?, ?)
+    `,
+      ).run(firstWaitlist.id, sessionId, firstWaitlist.name, "");
+
+      db.prepare("DELETE FROM waitlist WHERE id = ? AND session_id = ?").run(
+        firstWaitlist.id,
+        sessionId,
+      );
+    }
+
+    res.json(getSessionWithParticipants(sessionId));
   },
 );
 
@@ -360,7 +504,6 @@ app.post("/api/parse-session", async (req, res) => {
       - "thêm ng thêm sân" = if more people join, add more court. Put this into additionalInfo.
       - "ab 14uhr", "ab 17h" = player starts from that time
       - "14-16", "14-16h", "(14-16)" = player availability
-      - "+1" means an extra participant connected to the named person
 
       Rules:
       - Do not invent data.
@@ -373,6 +516,9 @@ app.post("/api/parse-session", async (req, res) => {
       - Participants with "ab 17h" get startTime "17:00", endTime "".
       - Keep original participant names clean without numbering and without time notes.
       - Preserve Vietnamese names and accents.
+      - Players after "Wartelist", "Waitlist", "Waiting list" go into waitlist.
+      - Empty waitlist numbers like "1." or "2." should be ignored.
+      - Waitlist players are NOT participants and do not count for capacity/payment.
 
       JSON shape:
       {
@@ -393,8 +539,8 @@ app.post("/api/parse-session", async (req, res) => {
         "participants": [
           {
             "name": string,
-            "startTime": string,
-            "endTime": string,
+            "startTime": HH:mm,
+            "endTime": HH:mm,
             "note": string
           }
         ],
@@ -433,9 +579,11 @@ app.post("/api/parse-session", async (req, res) => {
             additionalProperties: false,
             properties: {
               title: { type: "string" },
+              date: { type: "string" },
               subtitle: { type: "string" },
               capacity: { type: "number" },
               additionalInfo: { type: "string" },
+
               slots: {
                 type: "array",
                 items: {
@@ -446,22 +594,55 @@ app.post("/api/parse-session", async (req, res) => {
                     endTime: { type: "string" },
                     courtCount: { type: "number" },
                     maxPlayers: { type: "number" },
+                    note: { type: "string" },
                   },
                   required: [
                     "startTime",
                     "endTime",
                     "courtCount",
                     "maxPlayers",
+                    "note",
                   ],
+                },
+              },
+
+              participants: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: "string" },
+                    startTime: { type: "string" },
+                    endTime: { type: "string" },
+                    note: { type: "string" },
+                  },
+                  required: ["name", "startTime", "endTime", "note"],
+                },
+              },
+
+              waitlist: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: "string" },
+                    note: { type: "string" },
+                  },
+                  required: ["name", "note"],
                 },
               },
             },
             required: [
               "title",
+              "date",
               "subtitle",
               "capacity",
               "additionalInfo",
               "slots",
+              "participants",
+              "waitlist",
             ],
           },
         },
