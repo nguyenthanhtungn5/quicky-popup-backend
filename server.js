@@ -3,7 +3,8 @@ const cors = require("cors");
 const Database = require("better-sqlite3");
 
 const app = express();
-const db = new Database("database.sqlite");
+const dbPath = process.env.DB_PATH || "database.sqlite";
+const db = new Database(dbPath);
 
 require("dotenv").config();
 const OpenAI = require("openai");
