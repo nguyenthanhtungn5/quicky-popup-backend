@@ -559,7 +559,7 @@ app.post("/api/parse-session", async (req, res) => {
         ${text}
     `;
     const response = await openai.responses.create({
-      model: "gpt-4.1-nano",
+      model: "gpt-5.6-luna",
       input: [
         {
           role: "system",
