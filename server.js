@@ -124,7 +124,13 @@ const getSessionWithParticipants = (sessionId) => {
   `,
     )
     .all(session.id);
-  return { ...session, slots, participants, waitlist };
+  return {
+    ...session,
+    additionalInfo: session.additional_info || "",
+    slots,
+    participants,
+    waitlist,
+  };
 };
 
 app.get("/api/sessions", (req, res) => {
@@ -134,12 +140,9 @@ app.get("/api/sessions", (req, res) => {
     )
     .all();
 
-  const result = sessions.map((session) => ({
-    ...session,
-    participants: db
-      .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
-      .all(session.id),
-  }));
+  const result = sessions.map((session) =>
+    getSessionWithParticipants(session.id),
+  );
 
   res.json(result);
 });
@@ -151,12 +154,9 @@ app.get("/api/sessions/archived", (req, res) => {
     )
     .all();
 
-  const result = sessions.map((session) => ({
-    ...session,
-    participants: db
-      .prepare("SELECT id, name, slot FROM participants WHERE session_id = ?")
-      .all(session.id),
-  }));
+  const result = sessions.map((session) =>
+    getSessionWithParticipants(session.id),
+  );
 
   res.json(result);
 });
@@ -172,6 +172,95 @@ app.patch("/api/session/:id/archive", (req, res) => {
   db.prepare("UPDATE sessions SET archived = 1 WHERE id = ?").run(sessionId);
 
   res.json(getSessionWithParticipants(sessionId));
+});
+
+app.patch("/api/session/:id", (req, res) => {
+  const id = req.params.id;
+  const current = getSessionWithParticipants(id);
+
+  if (!current || current.archived) {
+    return res.status(404).json({
+      message: "Active session not found",
+    });
+  }
+
+  const {
+    title,
+    subtitle = "",
+    capacity,
+    additionalInfo = "",
+    slots = [],
+  } = req.body || {};
+
+  if (
+    typeof title !== "string" ||
+    !title.trim() ||
+    !Number.isInteger(Number(capacity)) ||
+    Number(capacity) < 1 ||
+    !Array.isArray(slots)
+  ) {
+    return res.status(400).json({
+      message: "Invalid session data",
+    });
+  }
+
+  const currentSlotIds = new Set(current.slots.map((s) => s.id));
+
+  if (
+    slots.some(
+      (s) =>
+        !currentSlotIds.has(s.id) ||
+        typeof s.startTime !== "string" ||
+        !s.startTime.trim() ||
+        typeof s.endTime !== "string" ||
+        !s.endTime.trim() ||
+        !Number.isInteger(Number(s.courtCount)) ||
+        Number(s.courtCount) < 1,
+    )
+  ) {
+    return res.status(400).json({
+      message: "Invalid slot data",
+    });
+  }
+
+  // MVP: Chỉ sửa slot hiện có, không thêm/xóa slot.
+  if (
+    slots.length !== current.slots.length ||
+    new Set(slots.map((s) => s.id)).size !== current.slots.length
+  ) {
+    return res.status(400).json({
+      message: "Cannot add or remove slots in edit mode",
+    });
+  }
+
+  const update = db.transaction(() => {
+    db.prepare(
+      `
+      UPDATE sessions
+      SET title = ?,
+          subtitle = ?,
+          capacity = ?,
+          additional_info = ?
+      WHERE id = ?
+    `,
+    ).run(title.trim(), subtitle, Number(capacity), additionalInfo, id);
+
+    const updateSlot = db.prepare(`
+      UPDATE session_slots
+      SET start_time = ?,
+          end_time = ?,
+          court_count = ?
+      WHERE id = ? AND session_id = ?
+    `);
+
+    slots.forEach((s) => {
+      updateSlot.run(s.startTime, s.endTime, Number(s.courtCount), s.id, id);
+    });
+  });
+
+  update();
+
+  res.json(getSessionWithParticipants(id));
 });
 
 app.patch("/api/session/:id/unarchive", (req, res) => {
@@ -368,10 +457,12 @@ app.delete(
   (req, res) => {
     const { sessionId, participantId } = req.params;
 
-    db.prepare("DELETE FROM participants WHERE id = ? AND session_id = ?").run(
-      participantId,
-      sessionId,
-    );
+    db.prepare(
+      `
+        DELETE FROM participant_slots
+        WHERE session_id = ? AND participant_id = ?
+      `,
+    ).run(sessionId, participantId);
 
     const firstWaitlist = db
       .prepare(
@@ -508,9 +599,23 @@ app.post("/api/parse-session", async (req, res) => {
 
       Rules:
       - Do not invent data.
-      - If one line says "2 sân 13-16h", create one slot from 13:00 to 16:00 with courtCount 2.
-      - If one line says "14-17h: 4 sân", create one slot from 14:00 to 17:00 with courtCount 4.
-      - If multiple court-time lines exist, create multiple slots.
+      - A slot represents one hour of playing time, not the entire court booking.
+      - Split every court booking range into consecutive one-hour slots.
+      - Example: "2 sân 13-16h" creates:
+        - 13:00-14:00, courtCount 2
+        - 14:00-15:00, courtCount 2
+        - 15:00-16:00, courtCount 2
+      - Example: "14-17h: 4 sân" creates:
+        - 14:00-15:00, courtCount 4
+        - 15:00-16:00, courtCount 4
+        - 16:00-17:00, courtCount 4
+      - For overlapping court bookings, sum the number of courts
+        available in each hour.
+      - Do not create duplicate slots with the same startTime and endTime.
+      - Sort slots chronologically.
+      - Do not invent courtCount for unspecified hours.
+      - If an interval cannot be divided exactly into one-hour
+        slots, preserve the remaining shorter interval.
       - If a court line contains a payer/person in parentheses, put it into note.
       - Participants without specific time get empty startTime/endTime.
       - Participants with "(14-16)" get startTime "14:00", endTime "16:00".
@@ -553,11 +658,7 @@ app.post("/api/parse-session", async (req, res) => {
         ]
       }
       `;
-    const userPrompt = `
-        Parse this badminton session text:
 
-        ${text}
-    `;
     const response = await openai.responses.create({
       model: "gpt-5.6-luna",
       input: [
