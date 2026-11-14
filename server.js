@@ -457,38 +457,78 @@ app.delete(
   (req, res) => {
     const { sessionId, participantId } = req.params;
 
-    db.prepare(
-      `
+    const session = getSessionWithParticipants(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: "Session not found" });
+    }
+
+    const removeParticipant = db.transaction(() => {
+      const wasParticipant = db
+        .prepare(
+          `
+        SELECT 1 FROM participants
+        WHERE session_id = ? AND id = ?
+      `,
+        )
+        .get(sessionId, participantId);
+
+      // 1. Remove participant's slots
+      db.prepare(
+        `
         DELETE FROM participant_slots
         WHERE session_id = ? AND participant_id = ?
       `,
-    ).run(sessionId, participantId);
+      ).run(sessionId, participantId);
 
-    const firstWaitlist = db
-      .prepare(
-        `
-      SELECT *
-      FROM waitlist
-      WHERE session_id = ?
-      ORDER BY position
-      LIMIT 1
-    `,
-      )
-      .get(sessionId);
-
-    if (firstWaitlist) {
+      // 2. Remove from participants
       db.prepare(
         `
-      INSERT INTO participants (id, session_id, name, slot)
-      VALUES (?, ?, ?, ?)
-    `,
-      ).run(firstWaitlist.id, sessionId, firstWaitlist.name, "");
+        DELETE FROM participants
+        WHERE session_id = ? AND id = ?
+      `,
+      ).run(sessionId, participantId);
 
-      db.prepare("DELETE FROM waitlist WHERE id = ? AND session_id = ?").run(
-        firstWaitlist.id,
-        sessionId,
-      );
-    }
+      // 3. Remove from waitlist
+      db.prepare(
+        `
+        DELETE FROM waitlist
+        WHERE session_id = ? AND id = ?
+      `,
+      ).run(sessionId, participantId);
+
+      // 4. Promote first waiting player only if
+      //    an actual participant has left
+      if (wasParticipant) {
+        const next = db
+          .prepare(
+            `
+          SELECT id, name FROM waitlist
+          WHERE session_id = ?
+          ORDER BY position ASC
+          LIMIT 1
+        `,
+          )
+          .get(sessionId);
+
+        if (next) {
+          db.prepare(
+            `
+            INSERT INTO participants (id, session_id, name, slot)
+            VALUES (?, ?, ?, ?)
+          `,
+          ).run(next.id, sessionId, next.name, "");
+
+          db.prepare(
+            `
+            DELETE FROM waitlist
+            WHERE session_id = ? AND id = ?
+          `,
+          ).run(sessionId, next.id);
+        }
+      }
+    });
+
+    removeParticipant();
 
     res.json(getSessionWithParticipants(sessionId));
   },
